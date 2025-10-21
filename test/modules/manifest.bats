@@ -2,7 +2,7 @@
 
 setup() {
   # Set the test root as the project root
-  DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." >/dev/null 2>&1 && pwd)"
+  DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." >/dev/null 2>&1 && pwd)"
 }
 
 trace() {
@@ -18,7 +18,7 @@ trace_cat() {
 }
 
 @test "should resolve manifest file with an include" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   local input_file=$(mktemp -u)
   local output_file=$(mktemp -u)
@@ -42,7 +42,7 @@ image=ubuntu
 additional_packages="git"
 root=true'
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
 
   [ "$status" -eq 0 ]
   [ "$output" = "$output_file" ]
@@ -52,7 +52,7 @@ root=true'
 }
 
 @test "should resolve manifest file with a nested include" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   local input_file=$(mktemp -u)
   local output_file=$(mktemp -u)
@@ -86,7 +86,7 @@ additional_packages="git"
 root=true
 init_hooks="echo hi"'
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
 
   [ "$status" -eq 0 ]
   [ "$output" = "$output_file" ]
@@ -96,7 +96,7 @@ init_hooks="echo hi"'
 }
 
 @test "should resolve manifest file with no include" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
   output_file=$(mktemp -u)
@@ -111,7 +111,7 @@ image=fedora
 root=true
 EOF
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
   [ "$status" -eq 0 ]
   [ "$output" = "$output_file" ]
 
@@ -121,7 +121,7 @@ EOF
 }
 
 @test "should not resolve manifest file with an unknown include" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   local input_file=$(mktemp -u)
   local output_file=$(mktemp -u)
@@ -136,14 +136,14 @@ include=unknown
 root=true
 EOF
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
 
   [ "$status" -ne 0 ]
 
 }
 
 @test "should not resolve manifest file with circular references" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   local input_file=$(mktemp -u)
   local output_file=$(mktemp -u)
@@ -162,14 +162,14 @@ include=rootbox
 additional_packages="git"
 EOF
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
 
   [ "$status" -ne 0 ]
   trace "$output"
 }
 
 @test "should not resolve manifest file with self references" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   local input_file=$(mktemp -u)
   local output_file=$(mktemp -u)
@@ -180,14 +180,14 @@ include=dannunzio
 image=ubuntu
 EOF
 
-  run resolve_includes "$input_file" "$output_file"
+  run manifest_resolve_includes "$input_file" "$output_file"
 
   [ "$status" -ne 0 ]
   trace "$output"
 }
 
 @test "should extract manifest section on the top of the file" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
 
@@ -208,7 +208,7 @@ EOF
   expected=$'image=ubuntu
 additional_packages="git"'
 
-  run read_section "my-box" "$input_file"
+  run manifest_read_section "my-box" "$input_file"
 
   [ "$status" -eq 0 ]
   [ "$output" = "$expected" ]
@@ -216,7 +216,7 @@ additional_packages="git"'
 }
 
 @test "should extract manifest section in the middle of the file" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
 
@@ -237,7 +237,7 @@ EOF
   expected=$'image=fedora
 root=true'
 
-  run read_section "my-other-box" "$input_file"
+  run manifest_read_section "my-other-box" "$input_file"
 
   [ "$status" -eq 0 ]
   [ "$output" = "$expected" ]
@@ -245,7 +245,7 @@ root=true'
 }
 
 @test "should extract manifest section on the bottom of the file" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
 
@@ -266,7 +266,7 @@ EOF
   expected=$'image=leap
 additional_packages="nvim"'
 
-  run read_section "my-final-box" "$input_file"
+  run manifest_read_section "my-final-box" "$input_file"
 
   [ "$status" -eq 0 ]
   [ "$output" = "$expected" ]
@@ -274,7 +274,7 @@ additional_packages="nvim"'
 }
 
 @test "should replace in the same file" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
 
@@ -292,7 +292,7 @@ line4
 line5
 line3'
 
-  run replace_line 2 "$to_add" "$input_file" "$input_file"
+  run manifest_replace_line 2 "$to_add" "$input_file" "$input_file"
 
   content=$(cat "$input_file")
 
@@ -303,7 +303,7 @@ line3'
 }
 
 @test "should replace in new file" {
-  . "$DIR/resolve"
+  . "$DIR/modules/manifest"
 
   input_file=$(mktemp -u)
 
@@ -321,7 +321,7 @@ line4
 line5
 line3'
 
-  run replace_line 2 "$to_add" "$input_file"
+  run manifest_replace_line 2 "$to_add" "$input_file"
 
   content=$(cat "$output")
 

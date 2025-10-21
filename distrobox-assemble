@@ -636,7 +636,7 @@ parse_file() {
 }
 
 # Exec
-. "./resolve"
+. "./modules/manifest"
 expanded_file=$(mktemp -u)
-resolve_includes "${input_file}" "${expanded_file}"
+manifest_resolve_includes "${input_file}" "${expanded_file}"
 parse_file "${expanded_file}"
