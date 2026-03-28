@@ -49,13 +49,70 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Fetch full history
+        run: git fetch --prune --unshallow --tags
+
+      - name: Get new contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME}"
+          # Find the previous tag (the one right before the current)
+          previous_tag=$(git tag --sort=-v:refname | grep -v "^${version}$" | head -n 1)
+
+          if [ -z "${previous_tag}" ]; then
+            echo "No previous tag found, skipping new contributors"
+            exit 0
+          fi
+
+          echo "Comparing ${previous_tag}..${version}"
+
+          # Get all unique GitHub usernames for commits in this range
+          current_authors=$(gh api --paginate \
+            "repos/${{ github.repository }}/compare/${previous_tag}...${version}" \
+            --jq '.commits[].author.login // empty' | sort -u)
+
+          # Get all unique GitHub usernames for commits before the previous tag
+          previous_authors=$(gh api --paginate \
+            "repos/${{ github.repository }}/commits?sha=${previous_tag}&per_page=100" \
+            --jq '.[].author.login // empty' | sort -u)
+
+          # Find authors who appear only in the current range
+          new_authors=$(comm -23 <(echo "${current_authors}") <(echo "${previous_authors}"))
+
+          if [ -z "${new_authors}" ]; then
+            echo "No new contributors found"
+            exit 0
+          fi
+
+          # Write new contributors section to a file
+          {
+            echo ""
+            echo "## New Contributors"
+            echo ""
+            while IFS= read -r author; do
+              echo "* @${author}"
+            done <<< "${new_authors}"
+          } > "${{ runner.temp }}/new-contributors.md"
+
       - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME}"
+          notes_file=$(mktemp)
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${version}" \
+            --jq '.body' > "${notes_file}"
+
+          # Append new contributors section if present
+          contributors_file="${{ runner.temp }}/new-contributors.md"
+          if [ -f "${contributors_file}" ]; then
+            cat "${contributors_file}" >> "${notes_file}"
+          fi
+
           gh release create "${version}" \
             --title "${version}" \
-            --generate-notes \
+            --notes-file "${notes_file}" \
             --prerelease \
             artifacts/*
