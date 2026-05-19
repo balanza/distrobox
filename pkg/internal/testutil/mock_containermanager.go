@@ -50,7 +50,14 @@ func (m *MockContainerManager) Name() string {
 func (m *MockContainerManager) CloneAsRoot() containermanager.ContainerManager {
 	m.Spy.CloneAsRoot = append(m.Spy.CloneAsRoot, []any{})
 	if m.RootClone == nil {
-		m.RootClone = &MockContainerManager{Root: true}
+		// Propagate override fields so tests that set them on the base
+		// mock see consistent behavior when code paths run on the root
+		// clone (real providers preserve fields across CloneAsRoot).
+		m.RootClone = &MockContainerManager{
+			Root:                   true,
+			ListContainersResult:   m.ListContainersResult,
+			InspectContainerResult: m.InspectContainerResult,
+		}
 	}
 	return m.RootClone
 }
