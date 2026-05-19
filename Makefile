@@ -33,7 +33,15 @@ uninstall:
 
 .PHONY: clean
 clean:
-	rm -f ./bin/distrobox
+	rm -f ./bin/distrobox ./bin/distrobox-cli-tests
+
+# End-to-end CLI smoke tests. Runs the built binary inside an isolated
+# container that has the requested CONTAINER_MANAGER installed. Pass either
+# `podman` (default) or `docker`.
+CONTAINER_MANAGER ?= podman
+.PHONY: test-cli
+test-cli:
+	./tests/cli/run.sh $(CONTAINER_MANAGER)
 
 .PHONY: lint
 lint:

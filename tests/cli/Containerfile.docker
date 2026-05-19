@@ -1,0 +1,28 @@
+# Test host for the distrobox CLI suite when CONTAINER_MANAGER=docker.
+# Uses the official docker-in-docker image; dockerd is started by
+# tests/cli/run.sh via the upstream entrypoint and we wait for the socket
+# before launching the test binary.
+FROM docker:28-dind
+
+# bash for sub-shell helpers in the entrypoint wait loop; jq is used by a few
+# assertions that parse `docker inspect` output.
+RUN apk add --no-cache bash jq ca-certificates
+
+WORKDIR /work
+ENV DBX_CONTAINER_MANAGER=docker \
+    DBX_NON_INTERACTIVE=1 \
+    DOCKER_TLS_CERTDIR="" \
+    DISTROBOX_BIN=/usr/local/bin/distrobox
+
+# The dind image's entrypoint starts dockerd in the background when it sees
+# the wrapper script run as the entrypoint. run.sh invokes this image with a
+# custom command that:
+#   1. spawns dockerd via dockerd-entrypoint.sh
+#   2. waits for /var/run/docker.sock
+#   3. pulls alpine once (avoids per-test pull cost)
+#   4. exec's the compiled test binary
+#
+# Binaries injected by run.sh:
+#   /usr/local/bin/distrobox       — binary under test
+#   /work/distrobox-cli-tests      — compiled `go test` binary
+ENTRYPOINT ["/work/entrypoint-docker.sh"]
