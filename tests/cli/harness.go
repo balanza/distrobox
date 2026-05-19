@@ -45,10 +45,13 @@ type Harness struct {
 	createdContainers []string
 }
 
-// New builds a Harness scoped to t. The HOME directory is created via
-// t.TempDir, which Go cleans up automatically. Containers created via
-// NewName are removed in t.Cleanup via the container manager directly so
-// failing tests do not strand state.
+// New builds a Harness scoped to t. The HOME directory is provisioned with
+// os.MkdirTemp (not t.TempDir) because rootless podman creates files in a
+// user namespace that the test process cannot directly remove — Go's
+// t.TempDir cleanup would fail with "permission denied" on those files.
+// Instead h.cleanup invokes `podman unshare rm -rf` (when applicable) and
+// then removes the directory. Containers created via NewName are also
+// removed in cleanup so failing tests do not strand state.
 func New(t *testing.T) *Harness {
 	t.Helper()
 
@@ -68,11 +71,16 @@ func New(t *testing.T) *Harness {
 		t.Fatalf("container manager %q not on PATH: %v", cm, err)
 	}
 
+	home, err := os.MkdirTemp("", "dbxtest-home-")
+	if err != nil {
+		t.Fatalf("creating per-test home: %v", err)
+	}
+
 	h := &Harness{
 		t:                t,
 		Binary:           binary,
 		ContainerManager: cm,
-		Home:             t.TempDir(),
+		Home:             home,
 	}
 
 	t.Cleanup(h.cleanup)
@@ -217,6 +225,15 @@ func (h *Harness) env() []string {
 		"DBX_CONTAINER_MANAGER": h.ContainerManager,
 		"DBX_NON_INTERACTIVE":   "1",
 	}
+	// When XDG_CONFIG_HOME points at an empty per-test directory, rootless
+	// podman silently falls back to compiled-in defaults instead of reading
+	// /etc/containers/{storage,containers}.conf. Pin both files explicitly
+	// so the system-wide overrides in the test image (mount_program for
+	// overlay-on-overlayfs, utsns=private, cgroups=enabled) actually apply.
+	if h.ContainerManager == "podman" {
+		override["CONTAINERS_STORAGE_CONF"] = "/etc/containers/storage.conf"
+		override["CONTAINERS_CONF"] = "/etc/containers/containers.conf"
+	}
 	return overrideEnv(env, override)
 }
 
@@ -250,4 +267,17 @@ func (h *Harness) cleanup() {
 	for _, name := range h.createdContainers {
 		_, _ = h.CM("rm", "-f", name)
 	}
+
+	// Rootless podman creates per-test storage under a user namespace; the
+	// resulting files are owned by mapped UIDs the test process cannot
+	// remove directly. Re-enter the namespace with `podman unshare` to
+	// clean them up, then drop the directory.
+	if h.ContainerManager == "podman" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "podman", "unshare", "rm", "-rf", h.Home)
+		cmd.Env = h.env()
+		_ = cmd.Run()
+	}
+	_ = os.RemoveAll(h.Home)
 }

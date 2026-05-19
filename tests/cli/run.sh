@@ -66,6 +66,7 @@ cp "${REPO_DIR}/bin/distrobox" "${BUILD_CTX}/distrobox"
 cp "${REPO_DIR}/bin/distrobox-cli-tests" "${BUILD_CTX}/distrobox-cli-tests"
 cp "${SCRIPT_DIR}/entrypoint-podman.sh" "${BUILD_CTX}/entrypoint-podman.sh"
 cp "${SCRIPT_DIR}/entrypoint-docker.sh" "${BUILD_CTX}/entrypoint-docker.sh"
+cp -r "${SCRIPT_DIR}/configs" "${BUILD_CTX}/configs"
 chmod +x "${BUILD_CTX}/entrypoint-podman.sh" "${BUILD_CTX}/entrypoint-docker.sh"
 
 # Assemble a tiny context wrapping the source Containerfile but with extra

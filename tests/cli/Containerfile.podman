@@ -13,6 +13,13 @@ RUN dnf install -y --setopt=install_weak_deps=False --best \
         which \
     && dnf clean all
 
+# Override the system-wide podman config so nested execution works:
+# storage.conf forces fuse-overlayfs (overlay-on-overlayfs is unsupported
+# without it), containers.conf flips utsns to private so child containers
+# can set their own hostname.
+COPY --chown=root:root configs/storage.conf    /etc/containers/storage.conf
+COPY --chown=root:root configs/containers.conf /etc/containers/containers.conf
+
 USER podman
 WORKDIR /work
 ENV DBX_CONTAINER_MANAGER=podman \
