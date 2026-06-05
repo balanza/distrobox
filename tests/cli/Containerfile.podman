@@ -1,0 +1,33 @@
+# Test host for the distrobox CLI suite when CONTAINER_MANAGER=podman.
+# Based on the official rootless-podman-in-podman image; subuid/subgid and
+# storage are already configured for the `podman` user.
+FROM quay.io/podman/stable
+
+# Tools needed by the test binary and a handful of assertions (jq for inspect
+# parsing, procps for pgrep used in process checks, which for PATH lookups).
+USER root
+RUN dnf install -y --setopt=install_weak_deps=False --best \
+        ca-certificates \
+        jq \
+        procps-ng \
+        which \
+    && dnf clean all
+
+# Override the system-wide podman config so nested execution works:
+# storage.conf forces fuse-overlayfs (overlay-on-overlayfs is unsupported
+# without it), containers.conf flips utsns to private so child containers
+# can set their own hostname.
+COPY --chown=root:root configs/storage.conf    /etc/containers/storage.conf
+COPY --chown=root:root configs/containers.conf /etc/containers/containers.conf
+
+USER podman
+WORKDIR /work
+ENV DBX_CONTAINER_MANAGER=podman \
+    DBX_NON_INTERACTIVE=1 \
+    DISTROBOX_BIN=/usr/local/bin/distrobox
+
+# Binaries injected by run.sh:
+#   /usr/local/bin/distrobox       — binary under test
+#   /work/distrobox-cli-tests      — compiled `go test` binary
+#   /work/entrypoint-podman.sh     — pulls smoke image with retry, then runs tests
+ENTRYPOINT ["/work/entrypoint-podman.sh"]
