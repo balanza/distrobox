@@ -1,0 +1,563 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# This file is part of the distrobox project: https://github.com/89luca89/distrobox
+#
+# Copyright (C) 2021 distrobox contributors
+#
+# distrobox is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 3
+# as published by the Free Software Foundation.
+#
+# distrobox is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with distrobox; if not, see <http://www.gnu.org/licenses/>.
+
+# POSIX
+#
+# qemu-distrobox — Boot an Ubuntu cloud image in QEMU and install distrobox inside it.
+#
+# Usage:
+#   extras/qemu-distrobox [--help]
+
+# ---------------------------------------------------------------------------
+# Constants (edit these to suit your needs)
+# ---------------------------------------------------------------------------
+
+# Path to the host's pre-built distrobox binaries (the main binary, init, export, host-exec).
+BIN_DIR="./bin"
+
+# Which files from BIN_DIR to copy into the guest.
+DISTROBOX_BINARIES="distrobox distrobox-init distrobox-export distrobox-host-exec"
+
+# Ubuntu cloud image settings.
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+IMAGE_NAME="noble-server-cloudimg-amd64.img"
+
+# SSH forwarding (host port -> guest port 22).
+# A random port in 2000-2999 is generated below (override via env SSH_PORT).
+SSH_PORT=""
+
+# Root password for the VM (set via cloud-init).
+VM_PASSWORD="distrobox"
+
+# VM resources.
+VM_MEMORY="2048"   # MB
+VM_CPUS="2"
+VM_DISK="10G"        # Disk size (e.g. "20G"), empty = inherit from cloud image
+
+# Persistent log directory — QEMU logs go here so they survive cleanup.
+LOG_DIR="."
+
+# Temporary directory used for cloud-init seed and overlay.
+WORK_DIR=""
+
+# PID of the QEMU process (for cleanup).
+QEMU_PID=""
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+# Print a message to stderr.
+info() {
+	printf '%s\n' "[qemu-distrobox] $*" >&2
+}
+
+# Common SSH options: skip host key checking and ignore known_hosts.
+# This avoids "host key changed" errors when re-creating VMs (OpenSSH disables
+# password auth when the host key has changed, even with StrictHostKeyChecking=no).
+SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o PreferredAuthentications=password"
+
+# If sshpass is available, use it to pass the password automatically.
+SSH_CMD_PREFIX=""
+if command -v sshpass >/dev/null 2>&1; then
+	SSH_CMD_PREFIX="sshpass -p ${VM_PASSWORD}"
+else
+	printf '%s\n' "[qemu-distrobox] Install sshpass to avoid password prompts: sudo apt install sshpass" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Step: Image download
+# ---------------------------------------------------------------------------
+
+download_image() {
+	if [ -f "${IMAGE_NAME}" ]; then
+		info "Image '${IMAGE_NAME}' already exists, skipping download."
+		return 0
+	fi
+
+	info "Downloading Ubuntu 24.04 LTS cloud image..."
+	info "  URL: ${IMAGE_URL}"
+
+	# Prefer curl, fall back to wget.
+	if command -v curl >/dev/null 2>&1; then
+		curl -LO --continue-at - "${IMAGE_URL}"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -c "${IMAGE_URL}"
+	else
+		info "ERROR: neither curl nor wget found — cannot download the image."
+		exit 1
+	fi
+
+	if [ ! -f "${IMAGE_NAME}" ]; then
+		info "ERROR: download failed — '${IMAGE_NAME}' not found."
+		exit 1
+	fi
+
+	info "Download complete: ${IMAGE_NAME}"
+}
+
+# ---------------------------------------------------------------------------
+# Step: Create cloud-init seed ISO
+# ---------------------------------------------------------------------------
+
+create_seed_iso() {
+	WORK_DIR="$(mktemp -d)"
+
+	# Write the cloud-init configuration files.
+	cat > "${WORK_DIR}/meta-data" <<-EOF
+instance-id: distrobox-test-vm
+local-hostname: distrobox-test
+EOF
+
+	# user-data: set root password and permit password auth.
+	# Ubuntu's default sshd_config sets `PermitRootLogin prohibit-password`,
+	# which refuses password login for root even when PasswordAuthentication
+	# is on and a root password is set. The runcmd below flips it to `yes`
+	# so the script's password-based root login actually succeeds.
+	cat > "${WORK_DIR}/user-data" <<-EOF
+#cloud-config
+ssh_pwauth: true
+disable_root: false
+chpasswd:
+  list: |
+    root:${VM_PASSWORD}
+  expire: false
+runcmd:
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - systemctl restart ssh
+EOF
+
+	# Generate the seed ISO.
+	if command -v genisoimage >/dev/null 2>&1; then
+		genisoimage -output "${WORK_DIR}/seed.iso" \
+			-volid cidata -joliet -rock \
+			"${WORK_DIR}/meta-data" \
+			"${WORK_DIR}/user-data" 2>&1
+	elif command -v mkisofs >/dev/null 2>&1; then
+		mkisofs -output "${WORK_DIR}/seed.iso" \
+			-volid cidata -joliet -rock \
+			"${WORK_DIR}/meta-data" \
+			"${WORK_DIR}/user-data" 2>&1
+	else
+		info "ERROR: neither genisoimage nor mkisofs found — cannot create cloud-init ISO."
+		exit 1
+	fi
+
+	info "Cloud-init seed ISO ready: ${WORK_DIR}/seed.iso"
+}
+
+# ---------------------------------------------------------------------------
+# Step: Launch QEMU
+# ---------------------------------------------------------------------------
+
+launch_qemu() {
+	local overlay_img="${WORK_DIR}/overlay.qcow2"
+	local backing_file
+
+	# Resolve the backing image to an absolute path so that qemu-img can
+	# find it regardless of where the overlay is created.
+	# qemu-img resolves -b relative to the overlay's directory, not CWD.
+	if command -v realpath >/dev/null 2>&1; then
+		backing_file="$(realpath "${IMAGE_NAME}")"
+	elif command -v readlink >/dev/null 2>&1; then
+		backing_file="$(readlink -f "${IMAGE_NAME}")"
+	else
+		backing_file="${IMAGE_NAME}"
+	fi
+
+	# Create a QCOW2 overlay backed by the pristine downloaded image.
+	# This keeps the original image untouched.
+	# If VM_DISK is set, create the overlay with that size so the guest sees
+	# a larger disk; cloud-init's growpart will expand the root partition
+	# automatically on first boot.
+	local _disk_size=""
+	[ -n "${VM_DISK:-}" ] && _disk_size="${VM_DISK}"
+	if ! qemu-img create -f qcow2 \
+		-b "${backing_file}" \
+		-F qcow2 \
+		"${overlay_img}" \
+		${_disk_size:+"$_disk_size"} 2>&1
+	then
+		info "ERROR: Failed to create QCOW2 overlay."
+		exit 1
+	fi
+
+	info "Starting QEMU (SSH forwarding on port ${SSH_PORT})..."
+
+	# Pick the best available accelerator: KVM > TCG
+	local accel
+	local cpu_model
+	if [ -e /dev/kvm ] 2>/dev/null; then
+		accel="kvm"
+		cpu_model="host"
+	else
+		accel="tcg"
+		cpu_model="max"
+		info "  KVM not available — using TCG (slow)."
+	fi
+
+	# Verify that the overlay and seed ISO actually exist before launching.
+	if [ ! -f "${overlay_img}" ]; then
+		info "ERROR: Overlay image not found at '${overlay_img}'"
+		exit 1
+	fi
+	if [ ! -f "${WORK_DIR}/seed.iso" ]; then
+		info "ERROR: Seed ISO not found at '${WORK_DIR}/seed.iso'"
+		exit 1
+	fi
+
+	# Launch QEMU in the background.
+	qemu-system-x86_64 \
+		-machine q35,accel="${accel}" \
+		-cpu "${cpu_model}" \
+		-smp "${VM_CPUS}" \
+		-m "${VM_MEMORY}" \
+		-drive file="${overlay_img}",format=qcow2,if=virtio \
+		-cdrom "${WORK_DIR}/seed.iso" \
+		-nic user,hostfwd=tcp::"${SSH_PORT}"-:22 \
+		-display none \
+		-serial none \
+		-pidfile "${WORK_DIR}/qemu.pid" \
+		> "${LOG_DIR}/qemu-distrobox.log" 2>&1 &
+
+	QEMU_PID=$!
+
+	# Wait a moment for QEMU to start, then check it's alive.
+	sleep 2
+	if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+		wait "${QEMU_PID}" 2>/dev/null || true
+		info "ERROR: QEMU failed to start. Log follows:"
+		sed 's/^/  /' "${LOG_DIR}/qemu-distrobox.log"
+		exit 1
+	fi
+
+	info "QEMU started (PID ${QEMU_PID})."
+	info "Waiting for SSH to become available on port ${SSH_PORT}..."
+}
+
+# ---------------------------------------------------------------------------
+# Step: Wait for SSH
+# ---------------------------------------------------------------------------
+
+wait_for_ssh() {
+	local max_attempts=60
+	local attempt=0
+
+	while [ "${attempt}" -lt "${max_attempts}" ]; do
+		attempt=$((attempt + 1))
+		if ${SSH_CMD_PREFIX} ssh ${SSH_OPTS} -o ConnectTimeout=1 \
+			-p "${SSH_PORT}" \
+			"root@127.0.0.1" \
+			"exit" >/dev/null 2>&1; then
+			info "SSH connection established after ${attempt} attempt(s)."
+			return 0
+		fi
+		sleep 5
+	done
+
+	info "ERROR: SSH did not become available after ${max_attempts} attempts."
+	info "Check QEMU log: ${LOG_DIR}/qemu-distrobox.log"
+	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step: Copy binaries and install distrobox
+# ---------------------------------------------------------------------------
+
+install_distrobox() {
+	local remote_tmp="/tmp/distrobox-install"
+
+	info "Creating temporary directory in guest..."
+	${SSH_CMD_PREFIX} ssh ${SSH_OPTS} -o ConnectTimeout=5 \
+		-p "${SSH_PORT}" \
+		"root@127.0.0.1" \
+		"mkdir -p '${remote_tmp}'" >/dev/null 2>&1
+
+	info "Copying distrobox binaries from '${BIN_DIR}' to guest..."
+	# Copy each binary via SCP.
+	for bin in ${DISTROBOX_BINARIES}; do
+		if [ -f "${BIN_DIR}/${bin}" ]; then
+			${SSH_CMD_PREFIX} scp ${SSH_OPTS} -P "${SSH_PORT}" \
+				"${BIN_DIR}/${bin}" \
+				"root@127.0.0.1:${remote_tmp}/" >/dev/null 2>&1
+			info "  Copied: ${bin}"
+		else
+			info "  WARNING: '${BIN_DIR}/${bin}' not found — skipping."
+		fi
+	done
+
+	# Also copy distrobox-init and distrobox-export from internal/inside-distrobox/assets
+	# if they weren't found in BIN_DIR (they're shell scripts, not the Go binary).
+	for asset in distrobox-init distrobox-export distrobox-host-exec; do
+		if [ -f "./internal/inside-distrobox/assets/${asset}" ]; then
+			${SSH_CMD_PREFIX} scp ${SSH_OPTS} -P "${SSH_PORT}" \
+				"./internal/inside-distrobox/assets/${asset}" \
+				"root@127.0.0.1:${remote_tmp}/" >/dev/null 2>&1
+			info "  Copied: ${asset} (from assets)"
+		fi
+	done
+
+	info "Installing distrobox in guest..."
+	${SSH_CMD_PREFIX} ssh ${SSH_OPTS} -o ConnectTimeout=10 \
+		-p "${SSH_PORT}" \
+		"root@127.0.0.1" \
+		"
+		set -e
+
+		# Copy binaries to /usr/local/bin.
+		for f in ${remote_tmp}/*; do
+			[ -f \"\$f\" ] || continue
+			cp \"\$f\" /usr/local/bin/
+		done
+		chmod 755 /usr/local/bin/distrobox /usr/local/bin/distrobox-init /usr/local/bin/distrobox-export /usr/local/bin/distrobox-host-exec 2>/dev/null || true
+
+		# Create subcommand symlinks.
+		for sub in assemble create enter ephemeral generate-entry ls list rm stop upgrade; do
+			ln -sf /usr/local/bin/distrobox /usr/local/bin/distrobox-\"\${sub}\"
+		done
+
+		# Clean up temporary directory.
+		rm -rf '${remote_tmp}'
+	" >/dev/null 2>&1
+
+	info "Distrobox installed successfully in the guest."
+}
+
+# ---------------------------------------------------------------------------
+# Step: Install podman inside the VM
+# ---------------------------------------------------------------------------
+
+install_podman() {
+	info "Installing podman via apt (this may take a while)..."
+
+	${SSH_CMD_PREFIX} ssh ${SSH_OPTS} -o ConnectTimeout=10 \
+		-p "${SSH_PORT}" \
+		"root@127.0.0.1" \
+		"
+		export DEBIAN_FRONTEND=noninteractive
+		apt-get update -qq
+		apt-get install -y -qq podman
+
+		# Podman refuses short image names (e.g. 'archlinux') unless
+		# unqualified-search-registries is set. Ubuntu's default
+		# registries.conf leaves it commented out, so add a drop-in
+		# that resolves short names against docker.io.
+		mkdir -p /etc/containers/registries.conf.d
+		printf '%s\n' 'unqualified-search-registries = ["docker.io"]' \
+			> /etc/containers/registries.conf.d/999-docker.conf
+	" >/dev/null 2>&1
+
+	info "Podman installed successfully in the guest."
+}
+
+# ---------------------------------------------------------------------------
+# Step: Resize root partition if disk was enlarged
+# ---------------------------------------------------------------------------
+
+resize_disk() {
+	info "Resizing root partition to fill the enlarged disk..."
+
+	# Run growpart + resize2fs via SSH with visible output so the user
+	# can see if something goes wrong (unlike other steps that are quiet).
+	${SSH_CMD_PREFIX} ssh ${SSH_OPTS} -o ConnectTimeout=10 \
+		-p "${SSH_PORT}" \
+		"root@127.0.0.1" \
+		"
+		set -e
+
+		# Detect root device (e.g. /dev/vda1) and partition number.
+		ROOT_DEV=\$(findmnt -n -o SOURCE /)
+		ROOT_PART=\${ROOT_DEV##*[a-z]}
+		ROOT_DISK=\${ROOT_DEV%%[0-9]*}
+
+		printf '[qemu-distrobox] Root device: %s, partition: %s, disk: %s\n' \
+			\"\${ROOT_DEV}\" \"\${ROOT_PART}\" \"\${ROOT_DISK}\"
+
+		# Show current disk size.
+		printf '[qemu-distrobox] Disk layout:\n'
+		lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT \"\${ROOT_DISK}\" 2>/dev/null || \
+			printf '  (lsblk unavailable on this guest)\n'
+
+		# Ensure growpart is available.
+		if ! command -v growpart >/dev/null 2>&1; then
+			export DEBIAN_FRONTEND=noninteractive
+			printf '[qemu-distrobox] Installing cloud-guest-utils (growpart)...\n'
+			apt-get install -y -qq cloud-guest-utils
+		fi
+
+		# Expand the root partition to fill the disk.
+		printf '[qemu-distrobox] Running growpart %s %s...\n' \"\${ROOT_DISK}\" \"\${ROOT_PART}\"
+		growpart -v \"\${ROOT_DISK}\" \"\${ROOT_PART}\" 2>&1 || \
+			echo '[qemu-distrobox] growpart: no space to grow or failed'
+
+		# Expand the filesystem on the root partition.
+		printf '[qemu-distrobox] Running resize2fs %s...\n' \"\${ROOT_DEV}\"
+		resize2fs \"\${ROOT_DEV}\" 2>&1 || \
+			echo '[qemu-distrobox] resize2fs: already at max size or failed'
+
+		# Show final disk usage.
+		printf '[qemu-distrobox] Final disk usage:\n'
+		df -h / || true
+		"
+
+	info "Disk resize step complete."
+}
+
+# ---------------------------------------------------------------------------
+# Step: Print connection info
+# ---------------------------------------------------------------------------
+
+print_connection_info() {
+	info ""
+	info "============================================="
+	info "  VM is running and ready!"
+	info "  Connect with:"
+	info "    ssh root@127.0.0.1 -p ${SSH_PORT}"
+	info "  Password: ${VM_PASSWORD}"
+	info ""
+	info "  Distrobox is installed. Try:"
+	info "    distrobox create -n test"
+	info "    distrobox enter test"
+	info "============================================="
+	info ""
+	info "Press Ctrl+C to stop the VM and exit."
+}
+
+# ---------------------------------------------------------------------------
+# Step: Cleanup trap
+# ---------------------------------------------------------------------------
+
+cleanup() {
+	info "Cleaning up..."
+
+	# Kill QEMU if running.
+	if [ -n "${QEMU_PID}" ] && kill -0 "${QEMU_PID}" 2>/dev/null; then
+		info "Stopping QEMU (PID ${QEMU_PID})..."
+		kill "${QEMU_PID}" 2>/dev/null
+		wait "${QEMU_PID}" 2>/dev/null
+	fi
+
+	# Also try PID file.
+	if [ -n "${WORK_DIR}" ] && [ -f "${WORK_DIR}/qemu.pid" ]; then
+		local pid
+		pid="$(cat "${WORK_DIR}/qemu.pid")"
+		kill "${pid}" 2>/dev/null || true
+	fi
+
+	# Remove temporary directory.
+	if [ -n "${WORK_DIR}" ] && [ -d "${WORK_DIR}" ]; then
+		rm -rf "${WORK_DIR}"
+	fi
+
+	info "Done."
+}
+
+# Register the cleanup function on script exit or interrupt.
+trap cleanup EXIT INT TERM HUP
+
+# ---------------------------------------------------------------------------
+# Step: Help / usage
+# ---------------------------------------------------------------------------
+
+usage() {
+	cat <<-EOF
+Usage: extras/qemu-distrobox [OPTIONS]
+
+Boot an Ubuntu 24.04 LTS cloud image in QEMU, install distrobox and podman
+inside it, and provide SSH access.
+
+Options:
+  -h, --help    Show this help message and exit.
+
+Environment variables (all optional):
+  BIN_DIR      Path to distrobox binaries on the host (default: ./bin)
+  SSH_PORT     Host port forwarded to guest SSH (default: random 2000-2999)
+  VM_PASSWORD  Root password for the VM (default: distrobox)
+  VM_MEMORY    RAM in MB (default: 2048)
+  VM_CPUS      Number of CPUs (default: 2)
+  VM_DISK      VM disk size (e.g. "20G") (default: 10G)
+
+Examples:
+  extras/qemu-distrobox
+  BIN_DIR=/path/to/bin SSH_PORT=2207 extras/qemu-distrobox
+EOF
+	exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# Parse arguments.
+for arg in "$@"; do
+	case "${arg}" in
+	-h | --help)
+		usage
+		;;
+	*)
+		printf 'Unknown option: %s\n' "${arg}" >&2
+		usage
+		;;
+	esac
+done
+
+# Override constants from environment if set.
+BIN_DIR="${BIN_DIR:-./bin}"
+if [ -z "${SSH_PORT:-}" ]; then
+	# Generate a random port in 2000-2999 to allow parallel VMs.
+	if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+		_rand_val="$(od -An -N2 -i /dev/urandom 2>/dev/null | tr -d ' \t')"
+		SSH_PORT="$((2000 + (_rand_val % 1000)))"
+	else
+		SSH_PORT="$((2000 + ($$ % 1000)))"
+	fi
+fi
+VM_PASSWORD="${VM_PASSWORD:-distrobox}"
+VM_MEMORY="${VM_MEMORY:-2048}"
+VM_CPUS="${VM_CPUS:-2}"
+VM_DISK="${VM_DISK:-}"
+
+# Sanity checks.
+if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+	info "ERROR: qemu-system-x86_64 not found — please install QEMU."
+	exit 1
+fi
+
+if ! command -v qemu-img >/dev/null 2>&1; then
+	info "ERROR: qemu-img not found — please install QEMU utilities."
+	exit 1
+fi
+
+# Run the steps in order.
+download_image
+create_seed_iso
+launch_qemu
+wait_for_ssh
+resize_disk
+install_distrobox
+install_podman
+print_connection_info
+
+# Wait for the VM to shut down, or until Ctrl+C triggers the cleanup trap.
+# Monitors QEMU's PID and exits cleanly when the VM stops.
+info "Waiting for VM shutdown (Ctrl+C to stop immediately)..."
+while kill -0 "${QEMU_PID:-}" 2>/dev/null; do
+	sleep 5
+done
+info "VM has shut down."
